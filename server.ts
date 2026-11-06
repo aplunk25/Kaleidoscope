@@ -24,7 +24,8 @@ const transitions: Record<Status, Partial<Record<Action, Status>>> = {
   ABANDONED: {},
 };
 
-const sessions = new Map<string, Session>();
+export const sessions = new Map<string, Session>();
+
 
 const isOpen = (s: Session) => s.status === 'ACTIVE' || s.status === 'PAUSED';
 const current = () => [...sessions.values()].find(isOpen);
@@ -41,7 +42,7 @@ const view = (s: Session) => ({
   remainingSeconds: Math.max(0, s.plannedSeconds - Math.floor(elapsedMs(s) / 1000)),
 });
 
-const app = express();
+export const app = express();
 app.use(express.json());
 
 app.post('/sessions', (req, res) => {
@@ -72,10 +73,27 @@ app.get('/sessions/current', (_req, res) => {
   s ? res.json(view(s)) : res.status(404).json({ error: 'no active session' });
 });
 
+
+// The parking lot: dump a thought without leaving the task
+app.post('/sessions/:id/distractions', (req, res) => {
+  const s = sessions.get(req.params.id);
+  const { note } = req.body ?? {};
+  if (!s || !isOpen(s)) return res.status(404).json({ error: 'no open session' });
+  if (typeof note !== 'string' || !note.trim()) {
+    return res.status(400).json({ error: 'note is required' });
+  }
+  s.distractions.push({ note: note.trim(), at: Date.now() });
+  res.status(201).json(view(s));
+});
+
 app.post('/sessions/:id/:action', (req, res) => {
   const s = sessions.get(req.params.id);
   const action = req.params.action as Action;
   if (!s) return res.status(404).json({ error: 'not found' });
+  const actions: Action[] = ['pause', 'resume', 'complete', 'abandon'];
+  if (!actions.includes(action)) {
+    return res.status(400).json({ error: `unknown action: ${action}` });
+  }
 
   const next = transitions[s.status][action];
   if (!next) {
@@ -94,16 +112,5 @@ app.post('/sessions/:id/:action', (req, res) => {
   res.json(view(s));
 });
 
-// The parking lot: dump a thought without leaving the task
-app.post('/sessions/:id/distractions', (req, res) => {
-  const s = sessions.get(req.params.id);
-  const { note } = req.body ?? {};
-  if (!s || !isOpen(s)) return res.status(404).json({ error: 'no open session' });
-  if (typeof note !== 'string' || !note.trim()) {
-    return res.status(400).json({ error: 'note is required' });
-  }
-  s.distractions.push({ note: note.trim(), at: Date.now() });
-  res.status(201).json(view(s));
-});
 
-app.listen(3000, () => console.log('http://localhost:3000'));
+
