@@ -128,3 +128,18 @@ test('rejects an empty distraction note', async () => {
   const res = await post(`/sessions/${body.id}/distractions`, { note: '   ' });
   assert.equal(res.status, 400);
 });
+
+
+test('stores the tiny first step', async () => {
+  const res = await post('/sessions', { task: 'Write essay', firstStep: 'open the doc' });
+  assert.equal(res.status, 201);
+  assert.equal((await res.json()).firstStep, 'open the doc');
+});
+
+test('pause saves a left-off note that survives resume', async () => {
+  const { body } = await startSession();
+  const paused = await (await post(`/sessions/${body.id}/pause`, { note: 'finishing intro' })).json();
+  assert.equal(paused.leftOffNote, 'finishing intro');
+  const resumed = await (await post(`/sessions/${body.id}/resume`)).json();
+  assert.equal(resumed.leftOffNote, 'finishing intro');
+});

@@ -11,9 +11,14 @@ type Action = z.infer<typeof actionSchema>;
 
 const createSessionSchema = z.object({
   task: z.string().trim().min(1, 'task is required').max(200),
+  firstStep: z.string().trim().min(1).max(200).optional(),
   plannedSeconds: z.number().int().min(60).max(4 * 60 * 60).default(900),
 });
 
+const actionBodySchema = z.object({
+    note: z.string().trim().min(1).max(500).optional(),
+
+})
 const distractionSchema = z.object({
   note: z.string().trim().min(1, 'note is required').max(500),
 });
@@ -90,7 +95,7 @@ app.post('/sessions', async (req, res) => {
 
   try {
     const s = await prisma.session.create({
-      data: { task: data.task, plannedSeconds: data.plannedSeconds },
+      data: { task: data.task, firstStep: data.firstStep, plannedSeconds: data.plannedSeconds },
       include: withDistractions,
     });
     res.status(201).json(view(s));
@@ -133,7 +138,9 @@ app.post('/sessions/:id/:action', async (req, res) => {
     return res.status(400).json({ error: `unknown action: ${req.params.action}` });
   }
   const action = parsed.data;
-
+  const body = parseBody(actionBodySchema, req.body, res);
+  if (!body) return;
+  
   const s = await prisma.session.findUnique({ where: { id: req.params.id } });
   if (!s) return res.status(404).json({ error: 'not found' });
 
@@ -153,6 +160,9 @@ app.post('/sessions/:id/:action', async (req, res) => {
     // If abandoned while paused, time stops counting at the moment of the pause
     data.endedAt = s.pausedAt ?? now;
   }
+  if ((action === 'pause' || action === 'abandon') && body.note) {
+  data.leftOffNote = body.note;
+  }
 
   // Optimistic concurrency: only update if the status is still what we read
   const { count } = await prisma.session.updateMany({
@@ -169,6 +179,7 @@ app.post('/sessions/:id/:action', async (req, res) => {
   });
   res.json(view(updated));
 });
+
 
 // Error handler (Express 5 forwards rejected async handlers here)
 app.use(

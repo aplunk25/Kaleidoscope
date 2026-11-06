@@ -24,6 +24,8 @@ model Session {
   pausedTotalMs  Int           @default(0)
   endedAt        DateTime?
   distractions   Distraction[]
+  firstStep      String? 
+  leftOffNote    String? 
 }
 
 model Distraction {
