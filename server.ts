@@ -1,6 +1,7 @@
 import express from 'express';
-import { randomUUID } from 'crypto';
 import { z } from 'zod';
+import { prisma } from './db';
+import type { Prisma } from './generated/prisma/client.js';
 
 type Status = 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'ABANDONED';
 
@@ -17,18 +18,6 @@ const distractionSchema = z.object({
   note: z.string().trim().min(1, 'note is required').max(500),
 });
 
-interface Session {
-  id: string;
-  task: string;
-  plannedSeconds: number;
-  status: Status;
-  startedAt: number;
-  pausedAt: number | null;
-  pausedTotalMs: number;
-  endedAt: number | null;
-  distractions: { note: string; at: number }[];
-}
-
 // State machine: from-status -> action -> to-status
 const transitions: Record<Status, Partial<Record<Action, Status>>> = {
   ACTIVE: { pause: 'PAUSED', complete: 'COMPLETED', abandon: 'ABANDONED' },
@@ -37,22 +26,33 @@ const transitions: Record<Status, Partial<Record<Action, Status>>> = {
   ABANDONED: {},
 };
 
-export const sessions = new Map<string, Session>();
+const withDistractions = { distractions: true } as const;
+type SessionWithDistractions = Prisma.SessionGetPayload<{
+  include: typeof withDistractions;
+}>;
 
-const isOpen = (s: Session) => s.status === 'ACTIVE' || s.status === 'PAUSED';
-const current = () => [...sessions.values()].find(isOpen);
+const OPEN: Status[] = ['ACTIVE', 'PAUSED'];
+
+const current = () =>
+  prisma.session.findFirst({
+    where: { status: { in: OPEN } },
+    include: withDistractions,
+  });
 
 // Never store elapsed time; derive it
-function elapsedMs(s: Session, now = Date.now()) {
-  const end = s.endedAt ?? s.pausedAt ?? now;
-  return end - s.startedAt - s.pausedTotalMs;
+function elapsedMs(s: SessionWithDistractions, now = Date.now()) {
+  const end = s.endedAt?.getTime() ?? s.pausedAt?.getTime() ?? now;
+  return end - s.startedAt.getTime() - s.pausedTotalMs;
 }
 
-const view = (s: Session) => ({
-  ...s,
-  elapsedSeconds: Math.floor(elapsedMs(s) / 1000),
-  remainingSeconds: Math.max(0, s.plannedSeconds - Math.floor(elapsedMs(s) / 1000)),
-});
+const view = (s: SessionWithDistractions) => {
+  const elapsed = Math.floor(elapsedMs(s) / 1000);
+  return {
+    ...s,
+    elapsedSeconds: elapsed,
+    remainingSeconds: Math.max(0, s.plannedSeconds - elapsed),
+  };
+};
 
 // Returns parsed data, or sends a 400 and returns null
 function parseBody<T extends z.ZodTypeAny>(
@@ -74,54 +74,67 @@ function parseBody<T extends z.ZodTypeAny>(
   return result.data;
 }
 
+const isUniqueViolation = (e: unknown) =>
+  typeof e === 'object' && e !== null && (e as { code?: string }).code === 'P2002';
+
 export const app = express();
 app.use(express.json());
 
-app.post('/sessions', (req, res) => {
+app.post('/sessions', async (req, res) => {
   const data = parseBody(createSessionSchema, req.body, res);
   if (!data) return;
-  if (current()) {
+
+  if (await current()) {
     return res.status(409).json({ error: 'finish or abandon your current session first' });
   }
-  const s: Session = {
-    id: randomUUID(),
-    task: data.task,
-    plannedSeconds: data.plannedSeconds,
-    status: 'ACTIVE',
-    startedAt: Date.now(),
-    pausedAt: null,
-    pausedTotalMs: 0,
-    endedAt: null,
-    distractions: [],
-  };
-  sessions.set(s.id, s);
-  res.status(201).json(view(s));
+
+  try {
+    const s = await prisma.session.create({
+      data: { task: data.task, plannedSeconds: data.plannedSeconds },
+      include: withDistractions,
+    });
+    res.status(201).json(view(s));
+  } catch (e) {
+    // Two requests raced past the check above: the database index is the backstop
+    if (isUniqueViolation(e)) {
+      return res.status(409).json({ error: 'finish or abandon your current session first' });
+    }
+    throw e;
+  }
 });
 
-app.get('/sessions/current', (_req, res) => {
-  const s = current();
-  s ? res.json(view(s)) : res.status(404).json({ error: 'no active session' });
+app.get('/sessions/current', async (_req, res) => {
+  const s = await current();
+  if (!s) return res.status(404).json({ error: 'no active session' });
+  res.json(view(s));
 });
 
 // The parking lot: dump a thought without leaving the task.
 // Must be registered BEFORE the generic /:action route below.
-app.post('/sessions/:id/distractions', (req, res) => {
-  const s = sessions.get(req.params.id);
-  if (!s || !isOpen(s)) return res.status(404).json({ error: 'no open session' });
+app.post('/sessions/:id/distractions', async (req, res) => {
+  const s = await prisma.session.findUnique({ where: { id: req.params.id } });
+  if (!s || !OPEN.includes(s.status)) {
+    return res.status(404).json({ error: 'no open session' });
+  }
   const data = parseBody(distractionSchema, req.body, res);
   if (!data) return;
-  s.distractions.push({ note: data.note, at: Date.now() });
-  res.status(201).json(view(s));
+
+  const updated = await prisma.session.update({
+    where: { id: s.id },
+    data: { distractions: { create: { note: data.note } } },
+    include: withDistractions,
+  });
+  res.status(201).json(view(updated));
 });
 
-app.post('/sessions/:id/:action', (req, res) => {
+app.post('/sessions/:id/:action', async (req, res) => {
   const parsed = actionSchema.safeParse(req.params.action);
   if (!parsed.success) {
     return res.status(400).json({ error: `unknown action: ${req.params.action}` });
   }
   const action = parsed.data;
 
-  const s = sessions.get(req.params.id);
+  const s = await prisma.session.findUnique({ where: { id: req.params.id } });
   if (!s) return res.status(404).json({ error: 'not found' });
 
   const next = transitions[s.status][action];
@@ -129,14 +142,41 @@ app.post('/sessions/:id/:action', (req, res) => {
     return res.status(409).json({ error: `cannot ${action} a ${s.status} session` });
   }
 
-  const now = Date.now();
-  if (action === 'pause') s.pausedAt = now;
+  const now = new Date();
+  const data: Prisma.SessionUpdateManyMutationInput = { status: next };
+  if (action === 'pause') data.pausedAt = now;
   if (action === 'resume' && s.pausedAt) {
-    s.pausedTotalMs += now - s.pausedAt;
-    s.pausedAt = null;
+    data.pausedTotalMs = s.pausedTotalMs + (now.getTime() - s.pausedAt.getTime());
+    data.pausedAt = null;
   }
-  if (action === 'complete' || action === 'abandon') s.endedAt = now;
+  if (action === 'complete' || action === 'abandon') {
+    // If abandoned while paused, time stops counting at the moment of the pause
+    data.endedAt = s.pausedAt ?? now;
+  }
 
-  s.status = next;
-  res.json(view(s));
+  // Optimistic concurrency: only update if the status is still what we read
+  const { count } = await prisma.session.updateMany({
+    where: { id: s.id, status: s.status },
+    data,
+  });
+  if (count === 0) {
+    return res.status(409).json({ error: 'session changed, please retry' });
+  }
+
+  const updated = await prisma.session.findUniqueOrThrow({
+    where: { id: s.id },
+    include: withDistractions,
+  });
+  res.json(view(updated));
 });
+
+// Error handler (Express 5 forwards rejected async handlers here)
+app.use(
+  (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if ((err as { type?: string })?.type === 'entity.parse.failed') {
+      return res.status(400).json({ error: 'invalid JSON body' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'internal_error' });
+  },
+);

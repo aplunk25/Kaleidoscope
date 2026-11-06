@@ -2,7 +2,8 @@ import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { app, sessions } from './server';
+import { app } from './server';
+import { prisma } from './db';
 
 let server: Server;
 let base: string;
@@ -13,12 +14,15 @@ before(async () => {
   base = `http://localhost:${(server.address() as AddressInfo).port}`;
 });
 
-after(() => {
+after(async () => {
   server.closeAllConnections();
   server.close();
+  await prisma.$disconnect(); // otherwise the test process hangs
 });
 
-beforeEach(() => sessions.clear()); // every test starts clean
+beforeEach(async () => {
+  await prisma.session.deleteMany();
+});
 
 const post = (path: string, body?: unknown) =>
   fetch(base + path, {
@@ -84,5 +88,43 @@ test('parking lot rejects closed sessions', async () => {
 test('unknown action returns 400', async () => {
   const { body } = await startSession();
   const res = await post(`/sessions/${body.id}/explode`);
+  assert.equal(res.status, 400);
+});
+
+test('database rejects a second open session even when the API check is bypassed', async () => {
+  await prisma.session.create({ data: { task: 'a', plannedSeconds: 600 } });
+  await assert.rejects(
+    prisma.session.create({ data: { task: 'b', plannedSeconds: 600 } }),
+  );
+});
+
+test('rejects invalid plannedSeconds', async () => {
+  for (const plannedSeconds of [-5, 0, 10, 1.5, 'banana', 999999]) {
+    const res = await post('/sessions', { task: 'x', plannedSeconds });
+    assert.equal(res.status, 400, `plannedSeconds=${plannedSeconds}`);
+  }
+});
+
+test('plannedSeconds defaults to 900', async () => {
+  const res = await post('/sessions', { task: 'x' });
+  assert.equal(res.status, 201);
+  assert.equal((await res.json()).plannedSeconds, 900);
+});
+
+test('rejects over-long task titles', async () => {
+  const res = await post('/sessions', { task: 'x'.repeat(201) });
+  assert.equal(res.status, 400);
+});
+
+test('validation errors explain what is wrong', async () => {
+  const res = await post('/sessions', { task: '' });
+  const body = await res.json();
+  assert.equal(body.error, 'validation_failed');
+  assert.equal(body.details[0].path, 'task');
+});
+
+test('rejects an empty distraction note', async () => {
+  const { body } = await startSession();
+  const res = await post(`/sessions/${body.id}/distractions`, { note: '   ' });
   assert.equal(res.status, 400);
 });
