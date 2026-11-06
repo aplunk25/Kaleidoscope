@@ -1,0 +1,37 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum SessionStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  ABANDONED
+}
+
+model Session {
+  id             String        @id @default(uuid())
+  task           String
+  plannedSeconds Int
+  status         SessionStatus @default(ACTIVE)
+  startedAt      DateTime      @default(now())
+  pausedAt       DateTime?
+  pausedTotalMs  Int           @default(0)
+  endedAt        DateTime?
+  distractions   Distraction[]
+}
+
+model Distraction {
+  id        String   @id @default(uuid())
+  sessionId String
+  note      String
+  createdAt DateTime @default(now())
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+}
