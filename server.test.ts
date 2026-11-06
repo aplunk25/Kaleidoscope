@@ -31,8 +31,8 @@ const post = (path: string, body?: unknown) =>
     body: body ? JSON.stringify(body) : undefined,
   });
 
-const startSession = async (task = 'Write cover letter') => {
-  const res = await post('/sessions', { task, plannedSeconds: 600 });
+const startSession = async (task = 'Write cover letter', plannedSeconds = 600) => {
+  const res = await post('/sessions', { task, plannedSeconds });
   return { res, body: await res.json() };
 };
 
@@ -142,4 +142,56 @@ test('pause saves a left-off note that survives resume', async () => {
   assert.equal(paused.leftOffNote, 'finishing intro');
   const resumed = await (await post(`/sessions/${body.id}/resume`)).json();
   assert.equal(resumed.leftOffNote, 'finishing intro');
+});
+
+
+
+test('extend adds 5 minutes by default', async () => {
+  const { body } = await startSession(); // planned 600
+  const res = await post(`/sessions/${body.id}/extend`);
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).plannedSeconds, 900);
+});
+
+test('extend accepts a custom amount', async () => {
+  const { body } = await startSession();
+  const res = await post(`/sessions/${body.id}/extend`, { seconds: 120 });
+  assert.equal((await res.json()).plannedSeconds, 720);
+});
+
+test('a paused session can be extended', async () => {
+  const { body } = await startSession();
+  await post(`/sessions/${body.id}/pause`);
+  const res = await post(`/sessions/${body.id}/extend`);
+  assert.equal(res.status, 200);
+});
+
+test('extend counts from now when the timer already ran out', async () => {
+  const { body } = await startSession(); // planned 600
+  await prisma.session.update({
+    where: { id: body.id },
+    data: { startedAt: new Date(Date.now() - 20 * 60 * 1000) }, // 20 min ago
+  });
+  const res = await post(`/sessions/${body.id}/extend`, { seconds: 300 });
+  const remaining = (await res.json()).remainingSeconds;
+  assert.ok(remaining >= 298 && remaining <= 300, `remaining=${remaining}`);
+});
+
+test('cannot extend a closed session', async () => {
+  const { body } = await startSession();
+  await post(`/sessions/${body.id}/complete`);
+  assert.equal((await post(`/sessions/${body.id}/extend`)).status, 409);
+});
+
+test('extend rejects invalid amounts', async () => {
+  const { body } = await startSession();
+  for (const seconds of [0, -60, 30, 5000, 1.5, 'x']) {
+    const res = await post(`/sessions/${body.id}/extend`, { seconds });
+    assert.equal(res.status, 400, `seconds=${seconds}`);
+  }
+});
+
+test('extend stops at the 4 hour cap', async () => {
+  const { body } = await startSession('Marathon', 4 * 60 * 60);
+  assert.equal((await post(`/sessions/${body.id}/extend`)).status, 409);
 });

@@ -9,10 +9,17 @@ type Status = 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'ABANDONED';
 const actionSchema = z.enum(['pause', 'resume', 'complete', 'abandon']);
 type Action = z.infer<typeof actionSchema>;
 
+const MAX_PLANNED_SECONDS = 4 * 60 * 60;
+
+
 const createSessionSchema = z.object({
   task: z.string().trim().min(1, 'task is required').max(200),
   firstStep: z.string().trim().min(1).max(200).optional(),
   plannedSeconds: z.number().int().min(60).max(4 * 60 * 60).default(900),
+});
+
+const extendSchema = z.object({
+  seconds: z.number().int().min(60).max(3600).default(300),
 });
 
 const actionBodySchema = z.object({
@@ -131,6 +138,49 @@ app.post('/sessions/:id/distractions', async (req, res) => {
   });
   res.status(201).json(view(updated));
 });
+
+
+
+app.post('/sessions/:id/extend', async (req, res) => {
+  const data = parseBody(extendSchema, req.body, res);
+  if (!data) return;
+
+  const s = await prisma.session.findUnique({
+    where: { id: req.params.id },
+    include: withDistractions,
+  });
+  if (!s) return res.status(404).json({ error: 'not found' });
+  if (!OPEN.includes(s.status)) {
+    return res.status(409).json({ error: `cannot extend a ${s.status} session` });
+  }
+
+  // "N more minutes" counts from now, even if the timer already ran out
+  const elapsed = Math.floor(elapsedMs(s) / 1000);
+  const newPlanned = Math.max(s.plannedSeconds, elapsed) + data.seconds;
+  if (newPlanned > MAX_PLANNED_SECONDS) {
+    return res.status(409).json({ error: 'session length limit reached, take a break' });
+  }
+
+  // Optimistic concurrency, same pattern as the state transitions
+  const { count } = await prisma.session.updateMany({
+    where: { id: s.id, status: s.status, plannedSeconds: s.plannedSeconds },
+    data: { plannedSeconds: newPlanned },
+  });
+  if (count === 0) {
+    return res.status(409).json({ error: 'session changed, please retry' });
+  }
+
+  const updated = await prisma.session.findUniqueOrThrow({
+    where: { id: s.id },
+    include: withDistractions,
+  });
+  res.json(view(updated));
+});
+
+
+
+
+
 
 app.post('/sessions/:id/:action', async (req, res) => {
   const parsed = actionSchema.safeParse(req.params.action);
